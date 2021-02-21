@@ -17,7 +17,7 @@
  *    4 - resourse limits
  *
  */
-
+#include<string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
