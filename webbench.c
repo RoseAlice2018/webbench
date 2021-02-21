@@ -1,473 +1,549 @@
-#include "socket.c"
-#include <unistd.h>
-#include <sys/param.h>
-#include <rpc/types.h>
-#include <getopt.h>
-#include <strings.h>
-#include <time.h>
-#include <signal.h>
+/*
+ * Modified by RoseAlice2018 2021-2-20
+ * (C) Radim Kolar 1997-2004
+ * This is free software, see GNU Public License version 2 for
+ * details.
+ *
+ * Simple forking WWW Server benchmark:
+ *
+ * Usage:
+ *   webbenchpro --help
+ *
+ * Return codes:
+ *    0 - sucess
+ *    1 - benchmark failed (server is not on-line)
+ *    2 - bad param
+ *    3 - internal error, pthread failed
+ *    4 - resourse limits
+ *
+ */
 
-/* values */
-//   判断压力测试是否达到设定时间
-volatile int timerexpired = 0;
-int speed = 0 ;// 记录进程成功得到服务器响应的数量，即成功数
-int failed = 0 ;//记录失败的数目
-int bytes = 0; //记录进程成功读取的字节数，当force=0时有效
-int http10=1;
-/* globals */
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <pthread.h>
+#include <rpc/types.h>
+#include <sys/time.h>
+#include <sys/param.h>
+#include <sys/resource.h>
+#include "socket.h"
+
+#define PROGRAM_VERSION "0.1"
 #define METHOD_GET 0
 #define METHOD_HEAD 1
 #define METHOD_OPTIONS 2
 #define METHOD_TRACE 3
-#define PROGRAM_VERSION "1.5"
-//HTTP 默认请求方式为GET， 也支持HEAD，OPTION，TRACE
-int method = METHOD_GET;
-int clients = 1;//并发数目，-c N 参数N表示并发数，默认为1个进程
-int force = 0;// 是否等待读取从server返回的数据，0表示要等待读取
-int force_reload=0;//是否使用缓存，1表示不缓存，0表示缓存
-int proxyport=80;//(代理)服务器端口
-char* proxyhost = NULL; //代理服务器地址
-int benchtime = 30;  //压力测试时间，通过-t参数设置，默认为30s
-/* internal */
-//管道，用于父子进程通信
-int mypipe[2];
-char host[MAXHOSTNAMELEN];//目标主机地址
+#define HTTP_09 0
+#define HTTP_10 1
+#define HTTP_11 2
+
+#define BUF_SIZE 1024
+#define URL_SIZE 1500
 #define REQUEST_SIZE 2048
-char request[REQUEST_SIZE]; // 发送的构造的HTTP请求
+#define START_SLEEP 10000
 
-// 长选项，getopt_long的参数
-static const struct option long_options[]=
+#define DEFAULT_PROXY 0
+#define DEFAULT_CLIENT 1
+#define DEFAULT_TIME 30
+#define DEFAULT_FORCE 0
+#define DEFAULT_PORT 80
+#define DEFAULT_METHOD METHOD_GET
+
+#define DEFAULT_FORE_RELOAD 0
+#define DEFAULT_STACK_SIZE 32768
+#define DEFAULT_HTTP_VER HTTP_11
+
+struct parameter
 {
- {"force",no_argument,&force,1},
- {"reload",no_argument,&force_reload,1},
- {"time",required_argument,NULL,'t'},
- {"help",no_argument,NULL,'?'},
- {"http09",no_argument,NULL,'9'},
- {"http10",no_argument,NULL,'1'},
- {"http11",no_argument,NULL,'2'},
- {"get",no_argument,&method,METHOD_GET},
- {"head",no_argument,&method,METHOD_HEAD},
- {"options",no_argument,&method,METHOD_OPTIONS},
- {"trace",no_argument,&method,METHOD_TRACE},
- {"version",no_argument,NULL,'V'},
- {"proxy",required_argument,NULL,'p'},
- {"clients",required_argument,NULL,'c'},
- {NULL,0,NULL,0}
+	int force;
+	int force_reload;
+	int proxy;
+	int http_ver;
+	int method;
+	int port;
+	int clients;
+	int bench_time;
+	char *host;
+	char *request;
 };
-/* prototypes */
-static void benchcore(const char* host,const int port, const char *request);
-static int bench(void);
-static void build_request(const char* url);
 
-// timerexpired = 1 时， 定时结束
-static void alarm_handler(int signal)
+struct thread_arg
 {
-    timerexpired=1;
+	char *host;
+	char *request;
+	int force;
+	int port;
+	int http_ver;
+	unsigned long speed;
+	unsigned long failed;
+	unsigned long httperr;
+	unsigned long bytes;
+};
+
+static char const *const gs_http_method[] =
+	{
+		"GET",
+		"HEAD",
+		"OPTION",
+		"TRACE",
+};
+
+static void *bench_thread(void *para);
+static int bench(struct parameter *para);
+static void build_request(const char *url, struct parameter *para);
+static int http_response_check(const char *response);
+static int parse_opt(int argc, char *argv[], struct parameter *para);
+static int resource_set(int clients);
+
+static int resource_set(int clients)
+{
 }
 
 static void usage(void)
 {
-    fprintf(stderr,
-	"webbench [option]... URL\n"
-	"  -f|--force               Don't wait for reply from server.\n"
-	"  -r|--reload              Send reload request - Pragma: no-cache.\n"
-	"  -t|--time <sec>          Run benchmark for <sec> seconds. Default 30.\n"
-	"  -p|--proxy <server:port> Use proxy server for request.\n"
-	"  -c|--clients <n>         Run <n> HTTP clients at once. Default one.\n"
-	"  -9|--http09              Use HTTP/0.9 style requests.\n"
-	"  -1|--http10              Use HTTP/1.0 protocol.\n"
-	"  -2|--http11              Use HTTP/1.1 protocol.\n"
-	"  --get                    Use GET request method.\n"
-	"  --head                   Use HEAD request method.\n"
-	"  --options                Use OPTIONS request method.\n"
-	"  --trace                  Use TRACE request method.\n"
-	"  -?|-h|--help             This information.\n"
-	"  -V|--version             Display program version.\n"
-	);
+	fprintf(stderr,
+			"webbenchpro [option]... URL\n"
+			"  -f|--force                      Don't wait for reply from server.\n"
+			"  -r|--reload                     Send reload request - Pragma: no-cache.\n"
+			"  -t|--time <sec>                 Run benchmark for <sec> seconds. Default 30.\n"
+			"  -p|--proxy <server:port>        Use proxy server for request.\n"
+			"  -c|--clients <n>                Run <n> HTTP clients at once. Default one.\n"
+			"  -9|--http09                     Use HTTP/0.9 style requests.\n"
+			"  -1|--http10                     Use HTTP/1.0 protocol.\n"
+			"  -2|--http11                     Use HTTP/1.1 protocol.\n"
+			"  --get                           Use GET request method.\n"
+			"  --head                          Use HEAD request method.\n"
+			"  --options                       Use OPTIONS request method.\n"
+			"  --trace                         Use TRACE request method.\n"
+			"  -?|-h|--help                    This information.\n"
+			"  -V|--version                    Display program version.\n");
+};
+
+static int parse_opt(int argc, char *argv[], struct parameter *para)
+{
+	const struct option long_options[] = {
+		{"force", no_argument, &para->force, 1},
+		{"reload", no_argument, &para->force_reload, 1},
+		{"get", no_argument, &para->method, METHOD_GET},
+		{"head", no_argument, &para->method, METHOD_HEAD},
+		{"options", no_argument, &para->method, METHOD_OPTIONS},
+		{"trace", no_argument, &para->method, METHOD_TRACE},
+		{"help", no_argument, NULL, '?'},
+		{"http09", no_argument, NULL, '9'},
+		{"http10", no_argument, NULL, '1'},
+		{"http11", no_argument, NULL, '2'},
+		{"version", no_argument, NULL, 'V'},
+		{"time", required_argument, NULL, 't'},
+		{"proxy", required_argument, NULL, 'p'},
+		{"clients", required_argument, NULL, 'c'},
+		{NULL, 0, NULL, 0}};
+
+	int opt = 0;
+	int options_index = 0;
+	char *tmp = NULL;
+
+	if (argc == 1)
+	{
+		usage();
+		return 0;
+	}
+
+	while ((opt = getopt_long(argc, argv, "912Vfrt:p:c:?h", long_options, &options_index)) != EOF)
+	{
+		switch (opt)
+		{
+		case 0:
+			break;
+		case 'f':
+			para->force = 1;
+			break;
+		case 'r':
+			para->force_reload = 1;
+			break;
+		case '9':
+			para->http_ver = HTTP_09;
+			break;
+		case '1':
+			para->http_ver = HTTP_10;
+			break;
+		case '2':
+			para->http_ver = HTTP_11;
+			break;
+		case 'V':
+			printf(PROGRAM_VERSION "\n");
+			return 0;
+		case 't':
+			para->bench_time = atoi(optarg);
+			break;
+		case 'p':
+			para->proxy = 1;
+			/* proxy server parsing server:port */
+			tmp = strrchr(optarg, ':');
+			if (tmp == NULL)
+			{
+				break;
+			}
+			if (tmp == optarg)
+			{
+				fprintf(stderr, "Error in option --proxy %s: Missing hostname.\n", optarg);
+				return -1;
+			}
+			if (tmp == optarg + strlen(optarg) - 1)
+			{
+				fprintf(stderr, "Error in option --proxy %s Port number is missing.\n", optarg);
+				return -1;
+			}
+			*tmp = '\0';
+			if ((para->port = atoi(tmp + 1) < 0))
+			{
+				fprintf(stderr, "Error in option --proxy %s Port number is invaild.\n", optarg);
+				return -1;
+			}
+			break;
+		case ':':
+		case 'h':
+		case '?':
+			usage();
+			return 0;
+			break;
+		case 'c':
+			para->clients = atoi(optarg);
+			break;
+		}
+	}
+
+	if (optind == argc)
+	{
+		fprintf(stderr, "webbenchpro: Missing URL!\n");
+		usage();
+		return 2;
+	}
+
+	if (para->clients <= 0)
+		para->clients = DEFAULT_CLIENT;
+	if (para->bench_time <= 0)
+		para->bench_time = DEFAULT_TIME;
+	return 1;
 }
 
-int main(int argc,char* argv[])
+int main(int argc, char *argv[])
 {
-    //getopt_long 的返回字符
-    int opt=0;
-    // getopt_long 的第五个参数，一般为0
-    int options_index=0;
-    char* tmp=NULL;
+	int ret;
+	char host[MAXHOSTNAMELEN];
+	char request[REQUEST_SIZE];
+	struct parameter para =
+		{
+			DEFAULT_FORCE,
+			DEFAULT_FORE_RELOAD,
+			DEFAULT_PROXY,
+			DEFAULT_HTTP_VER,
+			DEFAULT_METHOD,
+			DEFAULT_PORT,
+			DEFAULT_CLIENT,
+			DEFAULT_TIME,
+			host,
+			request,
+		};
+	//parse options
+	if ((ret = parse_opt(argc, argv, &para)) <= 0)
+		return ret < 0 ? 2 : 0;
 
-    if(argc == 1)
-    {
-        usage();
-        return 2;
-    }
-
-    //依次读取命令行参数，并通过opt 
-    while((opt=getopt_long(argc,argv,"912Vfrt:p:c:?h",long_options,&options_index))!=EOF)
-    {
-        switch(opt)
-        {
-            case 0 : break;
-            case 'f' : force=1;break;
-            case 'r' : force_reload=1;break;
-            case '9' : http10=0;break;
-            case '1' : http10=1;break;
-            case '2' : http10=2;break;
-            case 'V' : printf(PROGRAM_VERSION"\n");exit(0);
-            //-t 后跟压力测试时间，optarg返回，使用atoi转换成整数
-            case 't' : benchtime=atoi(optarg);break;
-            case 'p' :
-            /* proxy server parsing server:port */
-            tmp=strrchr(optarg,':');//server:port
-            proxyhost=optarg;
-            if(tmp==NULL)
-            {
-                break;
-            }
-            if(tmp==optarg)
-            {
-                 fprintf(stderr,"Error in option --proxy %s: Missing hostname.\n",optarg);
-                 return 2;
-            }
-            if(tmp==optarg+strlen(optarg)-1)
-	        {
-		        fprintf(stderr,"Error in option --proxy %s Port number is missing.\n",optarg);
-		        return 2;
-	        }
-            *tmp='\0';//获得代理地址
-            proxyport=atoi(tmp+1);break;//获得代理端口
-
-            case ':':
-            case 'h':
-            case '?':usage();return 2;break;
-            //并发数目 -c N
-            case 'c':clients = atoi(optarg);break;
-        }
-    }
-
-    //optind 返回第一个不包含选项的命令行参数，此处为URL值
-    if(optind==argc) 
-    {
-        fprintf(stderr,"webbench: Missing URL!\n");
-        usage();
-        return 2;
-    }
-    //此处多做一次判断，可以预防BUG，因为上文并发数目用户可能写0
-    if(clients==0)clients=1;
-    //压力测试默认为30s，如果用户写成0，则默认为60s
-    if(benchtime==0)   benchtime=60;
-    /* Copyright */
-    fprintf(stderr,"Webbench - Simple Web Benchmark "PROGRAM_VERSION"\n"
-	 "Copyright (c) Radim Kolar 1997-2004, GPL Open Source Software.\n"
-	 );
-    //构造HTTP请求头
-    build_request(argv[optind]);//参数为URL值
-    /* print bench info */
-    printf("\nBenchmarking: ");
-    /*  以下打印压力测试各种参数信息，HTTP协议，请求方式，并发个数，请求时间等。
-    * 
-    */
-   switch(method)
-   {
-       case METHOD_GET:
-        default:
-            printf("GET");break;
-        case METHOD_OPTIONS:
-            printf("OPTIONS");break;
-        case METHOD_HEAD:
-            printf("HEAD");break;
-	    case METHOD_TRACE:
-            printf("TRACE");break;
-   }
-   printf(" %s",argv[optind]);
-
-   switch(http10)
-   {
-       case 0: printf("(using HTTP/0.9)");break;
-       case 2: printf("(using HTTP/1.1)");break;
-   }
-   printf("\n");
-   if(clients==1) printf("1 client");
-   else 
-    printf("%d clients",clients);
-
-    printf(", running %d sec",benchtime);
-    if(force) printf(", early socket close");
-    if(proxyhost!=NULL) printf(", via proxy server %s:%d",proxyhost,proxyport);
-    if(force_reload) printf(", forcing reload");
-    printf(".\n");
-    //bench() 压力测试的核心代码
-    return bench();
+	build_request(argv[argc - 1], &para);
+	printf("\nWebBenchPro - Advanced Simple Web Benchmark " PROGRAM_VERSION "\n"
+		   "Copyright (c) Radim Kolar 1997-2004, GPL Open Source Software.\n");
+	//check resourse limits
+	if ((ret = resource_set(para.clients)) < 0)
+	{
+		fprintf(stderr, "\nSet %s  limit failed. \n"
+						"Try less clients or use higher authority or set \"ulimit -n -u\" manualy\n",
+				ret == -1 ? "NOFILE" : "NPROC");
+		return 4;
+	}
+	/* printf bench info */
+	printf("\nBenchmarking:%s %s", gs_http_method[para.method], argv[argc - 1]);
+	switch (para.http_ver)
+	{
+	case 0:
+		puts(" (using HTTP/0.9)");
+		break;
+	case 1:
+		puts(" (using HTTP/1.0)");
+		break;
+	case 2:
+		puts(" (using HTTP/1.1)");
+		break;
+	default:
+		puts(" (using HTTP/1.0)");
+		break;
+	}
+	/* check avaibility of target server */
+	ret = Socket(para.host, para.port);
+	if (ret < 0)
+	{
+		fprintf(stderr, "\nConnect to server failed. Aborting benchmark.\n");
+		return 1;
+	}
+	close(ret);
+	return bench(&para);
 }
 
-//构造HTTP请求头
-void build_request(const char* url)
+void build_request(const char *url, struct parameter *para)
 {
-    char tmp[10];
-    int i;
+	char tmp[10];
+	int i;
 
-    bzero(host,MAXHOSTNAMELEN);
-    bzero(request,REQUEST_SIZE);
+	bzero(para->host, MAXHOSTNAMELEN);
+	bzero(para->request, REQUEST_SIZE);
 
-    if(force_reload && proxyhost != NULL && http10 <1)
-        http10=1;
-    if(method==METHOD_HEAD && http10<1) http10=1;
-    if(method==METHOD_OPTIONS&&http10<2) http10=2;
-    if(method==METHOD_TRACE&& http10<2) http10=2;
+	if (para->force_reload && para->proxy && para->http_ver < HTTP_10)
+		para->http_ver = HTTP_10;
+	if (para->method == METHOD_HEAD && para->http_ver < HTTP_10)
+		para->http_ver = HTTP_10;
+	if (para->method == METHOD_OPTIONS && para->http_ver < HTTP_11)
+		para->http_ver = HTTP_11;
+	if (para->method == METHOD_TRACE && para->http_ver < HTTP_11)
+		para->http_ver = HTTP_11;
 
-    switch(method)
-    {
-        default:
-        case METHOD_GET: strcpy(request,"GET");break;
-        case METHOD_HEAD: strcpy(request,"HEAD");break;
-        case METHOD_OPTIONS: strcpy(request,"OPTIONS");break;
-        case METHOD_TRACE: strcpy(request,"TRACE");break;
-    }
+	strcpy(para->request, gs_http_method[para->method]);
+	strcat(para->request, " ");
 
-    strcat(request," ");
+	if (NULL == strstr(url, "://"))
+	{
+		fprintf(stderr, "\n%s: is not a valid URL.\n", url);
+		exit(2);
+	}
+	if (strlen(url) > URL_SIZE)
+	{
+		fprintf(stderr, "URL is too long.\n");
+		exit(2);
+	}
+	if (!para->proxy)
+		if (0 != strncasecmp("http://", url, 7))
+		{
+			fprintf(stderr, "\nOnly HTTP protocol is directly supported, set --proxy for others.\n");
+			exit(2);
+		}
+	/* protocol/host delimiter */
+	i = strstr(url, "://") - url + 3;
+	/* printf("%d\n",i); */
 
-    if(NULL==strstr(url,"://"))
-    {
-        fprintf(stderr, "\n%s: is not a valid URL.\n",url);
-        exit(2);
-    }
-    if(strlen(url)>1500)
-    {
-        fprintf(stderr,"URL is too long.\n");
-        exit(2);
-    }
-    if(proxyhost==NULL)
-    {
-        if(0!=strncasecmp("http://",url,7))//未使用代理服务器的情况下，只允许HTTP协议 
-        {
-            fprintf(stderr,"\nOnly HTTP protocol is directly supported, set --proxy for others.\n");
-            exit(2);
-        }
-    }
-    /* protocol/host delimiter */
-    // 指向"://"后的第一个字母
-    i = strstr(url,"://")-url+3;
-    /* printf("%d\n",i); */
-    // URL后必须得'/'
-    if(strchr(url+i,'/')==NULL)
-    {
-        fprintf(stderr,"\nInvalid URL syntax - hostname don't ends with '/'.\n");
-        exit(2);
-    }
-    // 如果未使用代理服务器，就表示肯定是HTTP协议
-    if(proxyhost==NULL)
-    {
-         /* get port from hostname */
-        // 如果是server : port 形式，解析主机和端口
-        if(index(url+i,':')!=NULL &&
-                index(url+i,':')<index(url+i,'/'))
-        {
-            // 获取主机地址
-            strncpy(host,url+i,strchr(url+i,':')-url-i);
-            bzero(tmp,10);
-            strncpy(tmp,index(url+i,':')+1,strchr(url+i,'/')-index(url+i,':')-1);
-            /* printf("tmp=%s\n",tmp); */
-            // 目标端口
-            proxyport=atoi(tmp);
-            if(proxyport==0) proxyport=80;
-        }     
-        else
-        {
-            strncpy(host,url+i,strcspn(url+i,"/"));
-        }
-        // printf("Host=%s\n",host);
-        // url + i + strcspn(url+i,"/") 得到域名后面的目标地址
-        strcat(request+strlen(request),url+i+strcspn(url+i,"/"));
-
-    }
-    else
-    {
-        // 如若使用代理服务器
-        strcat(request,url);
-    }
-
-    if(http10==1)
-        strcat(request," HTTP/1.0");
-    else if(http10 == 2)
-        strcat(request," HTTP/1.1");
-    
-    //完成如 GET / HTTP1.1后， 添加"\r\n"
-    strcat(request,"\r\n");
-    if(http10>0)
-    {
-        strcat(request,"User-Agent: WebBench "PROGRAM_VERSION"\r\n");
-    }    
-    if(proxyhost==NULL && http10>0)
-    {
-        strcat(request,"Host: ");
-        strcat(request,host);
-        strcat(request,"\r\n");
-    }
-    //force_reload=1 和存在代理服务器，则不缓存
-    if(force_reload && proxyhost!=NULL)
-    {
-        strcat(request,"Program: no-cache\r\n");
-    }
-    //如果为HTTP1.1，则存在长连接，应将Connection置为close
-    if(http10>1)
-        strcat(request,"Connection: close\r\n");
-    /* add empty line at end */
-    if(http10>0)
-        strcat(request,"\r\n");
+	if (strchr(url + i, '/') == NULL)
+	{
+		fprintf(stderr, "\nInvalid URL syntax - hostname don't ends with '/'.\n");
+		exit(2);
+	}
+	if (para->proxy)
+	{
+		strcat(para->request, url);
+	}
+	else
+	{
+		/* get port from hostname */
+		if (index(url + i, ':') != NULL &&
+			index(url + i, ':') < index(url + i, '/'))
+		{
+			strncpy(para->host, url + i, strchr(url + i, ':') - url - i);
+			bzero(tmp, 10);
+			strncpy(tmp, index(url + i, ':') + 1, strchr(url + i, '/') - index(url + i, ':') - 1);
+			/* printf("tmp=%s\n",tmp); */
+			para->port = atoi(tmp);
+			if (para->port == 0)
+				para->port = DEFAULT_PORT;
+		}
+		else
+		{
+			strncpy(para->host, url + i, strcspn(url + i, "/"));
+		}
+		strcat(para->request + strlen(para->request), url + i + strcspn(url + i, "/"));
+	}
+	if (para->http_ver == 1)
+		strcat(para->request, " HTTP/1.0");
+	else if (para->http_ver == 2)
+		strcat(para->request, " HTTP/1.1");
+	strcat(para->request, "\r\n");
+	if (para->http_ver > 0)
+		strcat(para->request, "User-Agent: WebBenchPro " PROGRAM_VERSION "\r\n");
+	if (!para->proxy && para->http_ver > 0)
+	{
+		strcat(para->request, "Host: ");
+		strcat(para->request, para->host);
+		strcat(para->request, "\r\n");
+	}
+	if (para->force_reload && para->proxy)
+	{
+		strcat(para->request, "Pragma: no-cache\r\n");
+	}
+	if (para->http_ver > 1)
+		strcat(para->request, "Connection: close\r\n");
+	/* add empty line at end */
+	if (para->http_ver > 0)
+		strcat(para->request, "\r\n");
+	// printf("Req=%s\n",para->request);
 }
 
-static int bench(void)
+static int bench(struct parameter *para)
 {
-    int i,j,k;
-    pid_t pid=0;
-    FILE* f;
+	int i;
+	unsigned long long speed = 0;
+	unsigned long long failed = 0;
+	unsigned long long httperr = 0;
+	unsigned long long bytes = 0;
+	// set thread args
+	struct thread_arg *args = malloc(sizeof(struct thread_arg) * para->clients);
+	if (args == NULL)
+	{
+		fprintf(stderr, "Malloc thread args failed. Aborting benchmark.\n");
+		return 3;
+	}
+	memset(args, 0, sizeof(args));
+	for (i = 0; i < para->clients; i++)
+	{
+		args[i].host = para->host;
+		args[i].port = para->port;
+		args[i].request = para->request;
+		args[i].http_ver = para->http_ver;
+		args[i].force = para->force;
+	}
+	//threads
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	if (pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE))
+	{
+		fprintf(stderr, "Set stack size failed. Aborting benchmark.\n");
+		return 3;
+	}
+	pthread_t *threads = malloc(sizeof(pthread_t) * (para->clients));
+	if (threads == NULL)
+	{
+		fprintf(stderr, "Malloc thread failed. Aborting benchmake.\n");
+		return 3;
+	}
 
-    /* check avaibility of target server */
-    i = Socket(proxyhost==NULL?host:proxyhost,proxyport);
-    if(i<0)
-    {
-        fprintf(stderr,"\nConnect to server failed. Aborting benchmark.\n");
-        return 1;
-    }
-    close(i);
-    /*create pipe */
-    if(pipe(mypipe))
-    {
-        perror("pipe failed.");
-        return 3;
-    }
-    /* fork childs */
-    for(i=0;i<clients;i++)
-    {
-        pid=fork();
-        if(pid <= (pid_t)0)
-        {
-            sleep(1);/*make childs faster*/
-            break;
-        }
-    }
+	printf("\n%d clients, running %d sec", para->clients, para->bench_time);
+	if (para->force)
+		printf(", early socket close");
+	if (para->proxy)
+		printf(", via proxy server %s:%d", para->host, para->port);
+	if (para->force_reload)
+		printf(", forcing reload");
+	printf(".\n");
 
-    if(pid < (pid_t)0)
-    {
-       fprintf(stderr,"problems forking worker no. %d\n",i);
-        perror("fork failed.");
-        return 3; 
-    }
-    //子进程调用benchcore函数测试
-    if(pid == (pid_t)0)
-    {
-        /* I am a child */
-        if(proxyhost==NULL)
-        benchcore(host,proxyport,request);
-        else 
-        benchcore(proxyhost,proxyport,request);
-
-        /* write results to pipe */
-        f=fdopen(mypipe[1],"w");
-        if(f==NULL)
-        {
-            perror("open pipe for writing failed.");
-            return 3;
-        }
-        //子进程酱结果写入管道
-        fprintf(f,"%d %d %d\n",speed,failed,bytes);
-	    fclose(f);
-        return 0;
-    }
-    else //父进程
-    {
-        f=fdopen(mypipe[0],"r"); //mypipe[0]与标准流相结合
-        if(f==NULL) 
-	    {
-            perror("open pipe for reading failed.");
-            return 3;
-	    }
-        setvbuf(f,NULL,_IONBF,0); //设置无缓冲区
-        speed=0;
-        failed=0;
-        bytes=0;
-
-        while(1)
-        {
-           //通过f从管道读取数据
-            pid=fscanf(f,"%d %d %d",&i,&j,&k);
-            if(pid<2)
-            {
-                fprintf(stderr,"Some of our childrens died.\n");
-                break;
-            }
-            // 父进程利用管道负责统计子进程的三种数据和
-            speed+=i;
-            failed+=j;
-            bytes+=k;
-            //当子进程数据读完后，就退出
-            if(--clients==0)break;
-        }
-        fclose(f);
-        //输出结果
-        printf("\nSpeed=%d pages/min, %d bytes/sec.\nRequests: %d susceed, %d failed.\n",
-		  (int)((speed+failed)/(benchtime/60.0f)),
-		  (int)(bytes/(float)benchtime),
-		  speed,
-		  failed);
-    }
-    return i;
+	//new thread
+	for (i = 0; i < para->clients; i++)
+	{
+		int ret_p = pthread_create(threads + i, &attr, bench_thread, args + i);
+		for (i = 0; i < para->clients; i++)
+		{
+			int ret_p = pthread_create(threads + i, &attr, bench_thread, args + i);
+			if (ret_p)
+			{
+				printf("pthread create error %d on %d\n", ret_p, i);
+				i--, para->clients--;
+				//exit (-1);
+			}
+		}
+	}
+	//main thread sleep
+	sleep(para->bench_time);
+	//calc the result
+	for (i = 0; i < para->clients; i++)
+	{
+		speed += args[i].speed;
+		httperr += args[i].httperr;
+		failed += args[i].failed;
+		bytes += args[i].bytes;
+	}
+	printf("\nSpeed=%llu pages/sec, %llu bytes/sec.\nRequests: %llu ok, %llu http error, %llu failed.\n",
+		   (speed + httperr + failed) / para->bench_time, bytes / para->bench_time, speed, httperr, failed);
+	return 0;
 }
 
-// 子进程进行压力测试，每个子进程都会调用
-void benchcore(const char *host,const int port,const char *req)
+#define ERR_PROCESS(a, b, c) \
+	{                        \
+		a++;                 \
+		close(b);            \
+		goto c;              \
+	}
+void *bench_thread(void *arg)
 {
-    int rlen;
-    char buf[1500];
-    int s,i;
-    struct sigaction sa;
+	usleep(START_SLEEP);
+	struct thread_arg *p_arg = (struct thread_arg *)arg;
+	int rlen = strlen(p_arg->request);
+	char buf[BUF_SIZE];
+	int s, i, cnt;
 
-    /* setup alarm signal handler */
-    // 设置alarm定时器处理函数
-    sa.sa_handler=alarm_handler;
-    sa.sa_flags=0;
-    //sigaction 成功则返回0，失败则返回-1
-    // 超时会产生信号SIGALRM，用sa中的指定函数处理
-    if(sigaction(SIGALRM,&sa,NULL))
-        exit(3);
-    alarm(benchtime);// 开始计时
+	while (1)
+	{
+	outloop:
+		s = Socket(p_arg->host, p_arg->port);
+		if (s < 0)
+		{
+			p_arg->failed++;
+			continue;
+		}
+		if (rlen != write(s, p_arg->request, rlen))
+		{
+			ERR_PROCESS(p_arg->failed, s, outloop);
+		}
+		if (p_arg->http_ver == HTTP_09)
+		{
+			if (shutdown(s, 1))
+			{
+				ERR_PROCESS(p_arg->failed, s, outloop);
+			}
+		}
+		if (p_arg->force == 0)
+		{
+			/* read all available data from socket */
+			cnt = 0;
+			while (1)
+			{
+				i = read(s, buf, BUF_SIZE);
+				if (i < 0)
+				{
+					ERR_PROCESS(p_arg->failed, s, outloop);
+				}
+				else if (i == 0)
+				{
+					if (cnt == 0)
+					{
+						//first read
+						ERR_PROCESS(p_arg->httperr, s, outloop);
+					}
+					break;
+				}
+				else
+				{
+					//check http status
+					p_arg->bytes += i;
+					if ((cnt++ == 0) && (http_response_check(buf) < 0))
+					{
+						ERR_PROCESS(p_arg->httperr, s, outloop);
+					}
+				}
+			}
+		}
+		if (close(s))
+		{
+			p_arg->failed++;
+			continue;
+		}
+		p_arg->speed++;
+	}
+	return NULL;
+}
 
-    rlen= strlen(req);
-    nexttry:while(1)
-    {
-       //超时则返回
-       if(timerexpired)
-       {
-           if(failed>0)
-           {
-               failed--;
-           }
-           return;
-       } 
-       s=Socket(host,port);
-       if(s<0){failed++;continue;}//连接失败，failed数++
-       if(rlen!=write(s,req,rlen)) {failed++;close(s);continue;} // header大小与发送的不相等，则失败
-       if(http10==0)  // 针对HTTP0.9的特殊处理，关闭s的写功能，成功则返回0，错误则返回-1
-	   if(shutdown(s,1)) { failed++;close(s);continue;}
-       if(force==0)  // force = 0表示等待从Server返回的数据
-        {
-            /* read all available data from socket */
-	        while(1)
-	        {
-                if(timerexpired) break; // timerexpired默认为0，在规定时间内读取当为1时表示定时结束 
-	            i=read(s,buf,1500); // 从socket读取返回数据
-                /* fprintf(stderr,"%d\n",i); */
-	            if(i<0) 
-                { 
-                    failed++;
-                    close(s);
-                    goto nexttry;
-                }
-	            else
-		            if(i==0) break;
-		        else
-			        bytes+=i;
-	        }
-        }
-        if(close(s)) {failed++;continue;}
-        speed++;
-    }
+int http_response_check(const char *response)
+{
+	int status = 0;
+	float version;
+	response += 5;
+	if ((sscanf(response, "%f %d", &version, &status) == 2) &&
+		(status >= 200 && status < 300))
+		return 0;
+	else
+		return -1;
 }
